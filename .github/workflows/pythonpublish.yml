@@ -1,32 +1,99 @@
-name: Upload Python Package
+name: Build Python distributions
 
 on:
-  release:
-    types: [created]
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * *" # Daily 6AM UTC build
 
 jobs:
-  publish:
-
+  build-wheels:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ['3.x']
+      fail-fast: true
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install setuptools wheel twine
-    - name: Build and publish
-      env:
-        TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
-        TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
-      run: |
-        python setup.py sdist bdist_wheel
-        twine upload dist/*
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+      - name: Install native dependencies (Ubuntu)
+        run: sudo apt-get update && sudo apt-get install -y libgpgme-dev libgpg-error-dev
+        if: "matrix.os == 'ubuntu-latest'"
+      - name: Install native dependencies (MacOS)
+        run: brew install swig gpgme
+        if: "matrix.os == 'macos-latest'"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install setuptools wheel fastimport paramiko urllib3 cibuildwheel setuptools-rust
+      - name: Install gpg on supported platforms
+        run: pip install -U gpg
+        if: "matrix.os != 'windows-latest'"
+      - name: Run test suite
+        run: python -m unittest tests.test_suite
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        if: "matrix.os == 'ubuntu-latest'"
+      - name: Build wheels
+        run: python -m cibuildwheel --output-dir wheelhouse
+      - name: Upload wheels
+        uses: actions/upload-artifact@v3
+        with:
+          path: ./wheelhouse/*.whl
+
+  build-sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+      - name: Build sdist
+        run: python -m build --sdist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v3
+        with:
+          path: ./dist/*.tar.gz
+
+  test-sdist:
+    needs:
+      - build-sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install twine
+      - name: Download sdist
+        uses: actions/download-artifact@v2
+        with:
+          name: artifact
+          path: dist
+      - name: Test sdist
+        run: twine check dist/*
+      - name: Test installation from sdist
+        run: pip install dist/*.tar.gz
+
+  publish:
+    runs-on: ubuntu-latest
+    needs:
+      - build-wheels
+      - build-sdist
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      id-token: write
+    environment:
+      name: pypi
+      url: https://pypi.org/p/xandikos
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v2
+        with:
+          name: artifact
+          path: dist
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
